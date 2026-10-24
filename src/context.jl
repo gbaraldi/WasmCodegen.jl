@@ -25,6 +25,9 @@ Base.@kwdef struct Config
     The code generator emits simple code (a local per value) and leaves allocating locals,
     putting values on the operand stack and the rest to it."
     optimize::Union{Nothing,Cmd} = `-O3`
+    "`cfunction` pointers and calls through them (`FunctionWrappers`) compile to typed Wasm
+    function references (`runtime/fwrappers.jl`)."
+    funcref_wrappers::Bool = false
 end
 
 """
