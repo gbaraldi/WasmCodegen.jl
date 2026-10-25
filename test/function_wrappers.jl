@@ -49,6 +49,37 @@ function fwrapper_test(f, args...)
     @test got === expected
 end
 
+@testset "llvm.assume detection reads the entry" begin
+    assume_ir = """
+        declare void @llvm.assume(i1)
+        define void @fw_assume(i8) {
+            %v = trunc i8 %0 to i1
+            call void @llvm.assume(i1 %v)
+            ret void
+        }"""
+    @test WasmCodegen.llvm_assume_only((assume_ir, "fw_assume"))
+    # an assume-only helper before an entry that stores: the call is not an assume
+    two = assume_ir * """
+
+        define void @entry(i64) {
+            %p = inttoptr i64 %0 to i8*
+            store i8 1, i8* %p
+            ret void
+        }"""
+    @test !WasmCodegen.llvm_assume_only((two, "entry"))
+    @test !WasmCodegen.llvm_assume_only((two, "fw_assume"))   # the entry must be the only definition
+    @test !WasmCodegen.llvm_assume_only((assume_ir, "missing"))
+    # a brace in a comment must not end the entry's body early
+    commented = """
+        declare void @llvm.assume(i1)
+        define void @entry(i8* %p) ; {call void @llvm.assume(i1 %v)}
+        {
+            store i8 1, i8* %p
+            ret void
+        }"""
+    @test !WasmCodegen.llvm_assume_only((commented, "entry"))
+end
+
 @testset "FunctionWrappers as funcrefs" begin
     @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(fw_const, (Float64,); config = WasmCodegen.Config(verify = :off))
     fwrapper_test(fw_const, 1.5)
