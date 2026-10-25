@@ -35,6 +35,16 @@ const FWG = FunctionWrapper{Float64, Tuple{Float64, NoParams}}(Shift(0.25))
 fw_singleton_const(x::Float64) = FWG(x, NoParams())
 fw_singleton(x::Float64) = FWG(x, NoParams()) + FunctionWrapper{Float64, Tuple{Float64, NoParams}}(Shift(x))(2x, NoParams())
 
+# pointer identity, as natively: wrappers of one callable type built alike share a code pointer,
+# different callables have different ones, an object has one pointer (from the wrapper or from
+# `pointer_from_objref`), none is null. (Natively, a wrapper built inline in another function gets
+# that call site's own `@cfunction` pointer; whether it equals a serialized wrapper's is not tested.)
+function fw_pointers(c::Float64)
+    w = FunctionWrapper{Float64, Tuple{Float64}}(Scale(c))
+    return (FWS.ptr != FWV[2].ptr) + 2 * (FWS.ptr == FWV[1].ptr) +
+           8 * (FWS.objptr != FWV[1].objptr) + 16 * (w.objptr != FWS.objptr) +
+           32 * (FWS.objptr == pointer_from_objref(FWS.obj::Base.RefValue{Scale})) + 64 * (w.ptr != C_NULL)
+end
 const FWC = WasmCodegen.Config(funcref_wrappers = true)
 
 const DUMP = get(ENV, "WCG_TEST_DUMP", "")
@@ -89,6 +99,7 @@ end
     fwrapper_test(fw_bool, 2.0)
     fwrapper_test(fw_bool, 0.5)
     fwrapper_test(fw_singleton_const, 1.5)
+    fwrapper_test(fw_pointers, 4.0)
     # natively on Julia 1.13 a wrapper built and called in one function can return a wrong value
     # (JuliaLang/FunctionWrappers.jl#36), so the module is compared with the unwrapped calls
     c = WasmCodegen.compile(fw_singleton, (Float64,); config = FWC, validate = isempty(DUMP))

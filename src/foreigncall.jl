@@ -649,11 +649,33 @@ function cfunc_trampoline!(cgm::CGModule, @nospecialize(callee), @nospecialize(r
 end
 
 "The constant instructions of a box owning a reference to `func` (type `sig`)."
-function funcptr_box_init(ts::Types, func::Func, sig::TypeRef)
+function funcptr_box_init(ts::Types, func::Func, sig::TypeRef, hash::Int32)
     box = funcptr_box_type!(ts, sig)
-    return Inst[Inst(:i32_const, typeid!(ts, Runtime.FuncPtrBox)), Inst(:i32_const, 0),
+    return Inst[Inst(:i32_const, typeid!(ts, Runtime.FuncPtrBox)), Inst(:i32_const, hash),
                 Inst(:ref_func, func), Inst(:struct_new, box)]
 end
+
+"""
+    funcptr_box!(cgm, info) -> (Global, Int64)
+
+The one box owning the reference to the trampoline `info`, and the address of pointers to it:
+its virtual address (its identity hash shifted by 32 bits, as for any pointer owner). Every
+pointer to one trampoline is the same pointer and pointers to different trampolines differ.
+(Natively, wrappers whose `@cfunction` comes from the same compiled code share a pointer, but a
+`@cfunction` compiled at another call site has a pointer of its own.)
+"""
+function funcptr_box!(cgm::CGModule, info::FuncInfo)
+    get!(cgm.helpers, (:funcptr_box, info.func)) do
+        ts = cgm.types
+        h = image_hash!(cgm.image, hash((:funcptr_box, objectid(info.mi))))
+        g = add_global!(cgm.mod, "jl_funcptr_$(length(cgm.helpers))", RefType(funcptr_box_type!(ts, info.func.type), false),
+                        false, funcptr_box_init(ts, info.func, info.func.type, h))
+        (g, owner_address(h))
+    end
+end
+
+"The virtual address of an object whose identity hash is `h` (see `push_memory_base!`)."
+owner_address(h::Int32) = reinterpret(Int64, UInt64(reinterpret(UInt32, h)) << 32)
 
 "`Expr(:cfunction, Ptr{Cvoid}, f, rt, argts, cc)`: a pointer owned by a box of the trampoline's reference."
 function emit_cfunction!(fc::FnCtx, ex::Expr, @nospecialize(typ))
@@ -669,12 +691,11 @@ function emit_cfunction!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     argts = collect(Any, ex.args[4]::Core.SimpleVector)
     info = cfunc_trampoline!(fc.cgm, f, rt, argts)
     ts = fc.cgm.types
-    for inst in funcptr_box_init(ts, info.func, info.func.type)
-        emit!(fc.b, inst.op, inst.imm...)
-    end
+    g, addr = funcptr_box!(fc.cgm, info)
+    emit!(fc.b, :global_get, g)
     o = new_local!(fc, jlvalue_ref(ts))
     emit!(fc.b, :local_set, o)
-    emit!(fc.b, :i64_const, 1)      # a nonzero address: never `C_NULL`
+    emit!(fc.b, :i64_const, addr)      # nonzero: never `C_NULL`
     return new_ptr!(fc, typ === Ptr{Cvoid} ? typ : Ptr{Cvoid}, o, nothing)
 end
 

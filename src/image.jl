@@ -50,9 +50,17 @@ The hash field of the header of the object `x`: of a mutable object, -k for its 
 """
 function header_hash(img::Image, @nospecialize(x))
     ismutable(x) && !(x isa String) || return Inst(:i32_const, 0)
-    push!(img.native_ids, objectid(x))
-    return Inst(:i32_const, -Int32(length(img.native_ids)))
+    return Inst(:i32_const, image_hash!(img, objectid(x)))
 end
+
+"A new identity hash of the image, for an object whose native `objectid` is `id`."
+function image_hash!(img::Image, id::UInt64)
+    push!(img.native_ids, id)
+    return -Int32(length(img.native_ids))
+end
+
+"The identity hash `header_hash` gave the serialized (or in progress) mutable object `x`."
+image_hash(img::Image, @nospecialize(x)) = -Int32(findfirst(==(objectid(x)), img.native_ids))
 
 types(img::Image) = img.cgm.types
 
@@ -649,9 +657,11 @@ function funcwrapper_ptr_fields!(img::Image, @nospecialize(x))
     argts = Any[Ref{objT}, (FW.map_cfunc_argtype(A) for A in Args.parameters)...]
     rt = FW.map_rettype(Ret)
     info = cfunc_trampoline!(cgm, callee, rt, argts)
-    bg = add_global!(cgm.mod, global_name(img, x) * "_fptr", RefType(funcptr_box_type!(ts, info.func.type), false),
-                     false, funcptr_box_init(ts, info.func, info.func.type))
-    objg = object_global!(img, x.obj)
-    return (Inst[Inst(:i64_const, 1), Inst(:global_get, bg)],
-            Inst[Inst(:i64_const, 1), Inst(:global_get, objg)])
+    bg, addr = funcptr_box!(cgm, info)
+    code = Inst[Inst(:i64_const, addr), Inst(:global_get, bg)]
+    # the object pointer: the `Ref`'s virtual address (its identity hash << 32, as a pointer made to it
+    # at run time) and the `Ref`
+    o = x.obj
+    objg = object_global!(img, o)
+    return (code, Inst[Inst(:i64_const, owner_address(image_hash(img, o))), Inst(:global_get, objg)])
 end
