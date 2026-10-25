@@ -636,6 +636,13 @@ function finish_image!(cgm::CGModule)
     cgm.mod.start = f
 end
 
+"The callee, return type and argument types of the `cfunction` of a `FunctionWrapper{Ret,Args}` of an `objT`."
+function funcwrapper_cfunction(FW::Module, @nospecialize(Ret), @nospecialize(Args), @nospecialize(objT))
+    callee = FW.CallWrapper{Ret}()
+    argts = Any[Ref{objT}, (FW.map_cfunc_argtype(A) for A in Args.parameters)...]
+    return callee, FW.map_rettype(Ret), argts
+end
+
 """
     funcwrapper_ptr_fields!(img, x, l, back) -> Union{Nothing, Tuple{Vector{Inst}, Vector{Inst}}}
 
@@ -651,14 +658,15 @@ function funcwrapper_ptr_fields!(img::Image, @nospecialize(x), l::Layout, back::
     FW = funcwrappers_module()
     FW === nothing && return nothing
     T = typeof(x)
-    (T isa DataType && T.name === FW.FunctionWrapper.body.body.name) || return nothing
+    # FunctionWrappers may have been loaded after WasmCodegen, so its bindings and methods are not in
+    # the compiler's world: they are read in the latest one
+    FWT = Base.invokelatest(getglobal, FW, :FunctionWrapper)
+    (T isa DataType && T.name === FWT.body.body.name) || return nothing
     cgm = img.cgm
     ts = types(img)
     Ret, Args = T.parameters
     objT = x.objT
-    callee = FW.CallWrapper{Ret}()
-    argts = Any[Ref{objT}, (FW.map_cfunc_argtype(A) for A in Args.parameters)...]
-    rt = FW.map_rettype(Ret)
+    callee, rt, argts = Base.invokelatest(funcwrapper_cfunction, FW, Ret, Args, objT)
     info = cfunc_trampoline!(cgm, callee, rt, argts)
     bg, addr = funcptr_box!(cgm, info)
     code = Inst[Inst(:i64_const, addr), Inst(:global_get, bg)]

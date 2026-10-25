@@ -1,5 +1,7 @@
 # FunctionWrappers through typed function references (`Config(funcref_wrappers = true)`): wrappers built
 # at compile time and serialized, and wrappers built at run time; by-value arguments and results.
+# FunctionWrappers is loaded here, after WasmCodegen (run alone, this file checks that the compiler does
+# not need it loaded first).
 using FunctionWrappers: FunctionWrapper
 
 struct Scale
@@ -34,7 +36,6 @@ end
 const FWG = FunctionWrapper{Float64, Tuple{Float64, NoParams}}(Shift(0.25))
 fw_singleton_const(x::Float64) = FWG(x, NoParams())
 fw_singleton(x::Float64) = FWG(x, NoParams()) + FunctionWrapper{Float64, Tuple{Float64, NoParams}}(Shift(x))(2x, NoParams())
-
 # a singleton argument next to an `Any` one
 struct Either
     c::Float64
@@ -47,6 +48,7 @@ struct Nine end
 (::Nine)(a, b, c, d, e, f, g, h, ::NoParams) = a + b + c + d + e + f + g + h
 const FW9 = FunctionWrapper{Float64, Tuple{ntuple(_ -> Float64, 8)..., NoParams}}(Nine())
 fw_nine(x::Float64) = FW9(x, x, x, x, x, x, x, x, NoParams())
+
 # pointer identity, as natively: wrappers of one callable type built alike share a code pointer,
 # different callables have different ones, an object has one pointer (from the wrapper or from
 # `pointer_from_objref`), none is null. (Natively, a wrapper built inline in another function gets
