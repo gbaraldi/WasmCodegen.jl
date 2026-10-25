@@ -25,6 +25,12 @@ Base.@kwdef struct Config
     The code generator emits simple code (a local per value) and leaves allocating locals,
     putting values on the operand stack and the rest to it."
     optimize::Union{Nothing,Cmd} = `-O3`
+    "Callees whose optimized code has more than this many statements are not inlined into their
+    callers, as far as the interpreter can tell their size (0: Julia's inlining decisions as
+    they are). Large inlined bodies make the structurizer and `wasm-opt` slow. The cap can also
+    reduce constant propagation into capped callees (inference's size-dependent heuristic).
+    (Julia 1.13 and later; ignored on 1.12, whose inlining policy does not see the callee.)"
+    inline_cap::Int = 0
 end
 
 """
