@@ -632,7 +632,9 @@ function cfunc_trampoline!(cgm::CGModule, @nospecialize(callee), @nospecialize(r
     (rt isa Type && rt <: Ref) && unsupported("a cfunction returning by reference: ", rt)
     info = if any(singleton_ref, rest)
         mask = Tuple(singleton_ref(T) for T in rest)
-        S = Tuple{(singleton_ref(T) ? T.parameters[1] : T for T in rest)...}
+        # only the singleton types are read; `Nothing` elsewhere keeps `S` concrete (an `Any` argument
+        # would make it abstract, and `Type{S}` a parameter)
+        S = Tuple{(singleton_ref(T) ? T.parameters[1] : Nothing for T in rest)...}
         length(rest) <= 8 || unsupported("a cfunction with more than 8 arguments and a singleton one: ", argts)
         runtime_function!(cgm, Runtime.fw_trampoline_singletons,
                           (Type{objT}, Type{S}, Val{mask}, Core.Typeof(callee), Ptr{Cvoid},

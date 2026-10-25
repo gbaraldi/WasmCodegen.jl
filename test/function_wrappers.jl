@@ -35,6 +35,18 @@ const FWG = FunctionWrapper{Float64, Tuple{Float64, NoParams}}(Shift(0.25))
 fw_singleton_const(x::Float64) = FWG(x, NoParams())
 fw_singleton(x::Float64) = FWG(x, NoParams()) + FunctionWrapper{Float64, Tuple{Float64, NoParams}}(Shift(x))(2x, NoParams())
 
+# a singleton argument next to an `Any` one
+struct Either
+    c::Float64
+end
+(e::Either)(x, ::NoParams) = x === nothing ? -e.c : e.c
+const FWA = FunctionWrapper{Float64, Tuple{Any, NoParams}}(Either(0.5))
+fw_any_singleton(x::Float64) = FWA(nothing, NoParams()) + 3 * FWA(x, NoParams())
+# nine arguments with a singleton one: beyond the trampolines' arities, rejected
+struct Nine end
+(::Nine)(a, b, c, d, e, f, g, h, ::NoParams) = a + b + c + d + e + f + g + h
+const FW9 = FunctionWrapper{Float64, Tuple{ntuple(_ -> Float64, 8)..., NoParams}}(Nine())
+fw_nine(x::Float64) = FW9(x, x, x, x, x, x, x, x, NoParams())
 # pointer identity, as natively: wrappers of one callable type built alike share a code pointer,
 # different callables have different ones, an object has one pointer (from the wrapper or from
 # `pointer_from_objref`), none is null. (Natively, a wrapper built inline in another function gets
@@ -119,6 +131,8 @@ end
     fwrapper_test(fw_bool, 2.0)
     fwrapper_test(fw_bool, 0.5)
     fwrapper_test(fw_singleton_const, 1.5)
+    fwrapper_test(fw_any_singleton, 2.0)
+    @test_throws WasmCodegen.UnsupportedConstructs WasmCodegen.compile(fw_nine, (Float64,); config = FWC)
     fwrapper_test(fw_pointers, 4.0)
     fwrapper_test(fw_cycle, 1.5)
     fwrapper_test(fw_cycle_ref, 1.5)
