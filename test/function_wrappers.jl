@@ -45,6 +45,26 @@ function fw_pointers(c::Float64)
            8 * (FWS.objptr != FWV[1].objptr) + 16 * (w.objptr != FWS.objptr) +
            32 * (FWS.objptr == pointer_from_objref(FWS.obj::Base.RefValue{Scale})) + 64 * (w.ptr != C_NULL)
 end
+# a wrapper reachable again from its own callable (through a mutable holder)
+mutable struct Holder
+    fw::Any
+end
+struct Back
+    h::Holder
+end
+(b::Back)(x::Float64) = x + 1.0
+const HOLD = Holder(nothing)
+const FWB = FunctionWrapper{Float64, Tuple{Float64}}(Back(HOLD))
+HOLD.fw = FWB
+fw_cycle(x::Float64) = FWB(x) + (HOLD.fw === FWB ? 10.0 : 0.0) +
+                       (unsafe_pointer_to_objref(FWB.objptr) === FWB.obj ? 100.0 : 0.0)
+# the same cycle serialized from the callable's side, so that the wrapper is reached while its `Ref` is in progress
+const REFB = FWB.obj::Base.RefValue{Back}
+function fw_cycle_ref(x::Float64)
+    w = REFB[].h.fw::FunctionWrapper{Float64, Tuple{Float64}}
+    return w(x) + (unsafe_pointer_to_objref(w.objptr) === REFB ? 100.0 : 0.0)
+end
+
 const FWC = WasmCodegen.Config(funcref_wrappers = true)
 
 const DUMP = get(ENV, "WCG_TEST_DUMP", "")
@@ -100,6 +120,8 @@ end
     fwrapper_test(fw_bool, 0.5)
     fwrapper_test(fw_singleton_const, 1.5)
     fwrapper_test(fw_pointers, 4.0)
+    fwrapper_test(fw_cycle, 1.5)
+    fwrapper_test(fw_cycle_ref, 1.5)
     # natively on Julia 1.13 a wrapper built and called in one function can return a wrong value
     # (JuliaLang/FunctionWrappers.jl#36), so the module is compared with the unwrapped calls
     c = WasmCodegen.compile(fw_singleton, (Float64,); config = FWC, validate = isempty(DUMP))

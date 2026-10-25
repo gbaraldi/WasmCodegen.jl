@@ -342,11 +342,12 @@ end
 function struct_global!(img::Image, @nospecialize(x), l::Layout)
     ts = types(img)
     T = typeof(x)
-    fwptrs = img.cgm.config.funcref_wrappers ? funcwrapper_ptr_fields!(img, x) : nothing
     push!(img.inprogress, x)
     back = Any[]
     init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]
     try
+        # (after `x` is in progress, so that an object reached from the wrapped callable may refer back to it)
+        fwptrs = img.cgm.config.funcref_wrappers ? funcwrapper_ptr_fields!(img, x, l, back) : nothing
         for i in 1:fieldcount(T)
             FT = fieldtype(T, i)
             if fwptrs !== nothing && i <= 2
@@ -636,15 +637,17 @@ function finish_image!(cgm::CGModule)
 end
 
 """
-    funcwrapper_ptr_fields!(img, x) -> Union{Nothing, Tuple{Vector{Inst}, Vector{Inst}}}
+    funcwrapper_ptr_fields!(img, x, l, back) -> Union{Nothing, Tuple{Vector{Inst}, Vector{Inst}}}
 
 For a `FunctionWrappers.FunctionWrapper` object built natively (`Config(funcref_wrappers = true)`):
 the leaves of its two pointer fields in the image. The code pointer becomes a pointer owned by a
 box holding the reference to the trampoline compiled for the wrapped object's type, the object
 pointer a pointer owned by the `Ref` of the object, as `emit_cfunction!` builds them at run time
-(`runtime/fwrappers.jl`). `nothing` for every other object.
+(`runtime/fwrappers.jl`). If that `Ref` is being serialized (the wrapper is reachable from its own
+callable), the owner is set afterwards, as for any field referring back (`back`, `l`: the
+wrapper's layout). `nothing` for every other object.
 """
-function funcwrapper_ptr_fields!(img::Image, @nospecialize(x))
+function funcwrapper_ptr_fields!(img::Image, @nospecialize(x), l::Layout, back::Vector{Any})
     FW = funcwrappers_module()
     FW === nothing && return nothing
     T = typeof(x)
@@ -660,8 +663,12 @@ function funcwrapper_ptr_fields!(img::Image, @nospecialize(x))
     bg, addr = funcptr_box!(cgm, info)
     code = Inst[Inst(:i64_const, addr), Inst(:global_get, bg)]
     # the object pointer: the `Ref`'s virtual address (its identity hash << 32, as a pointer made to it
-    # at run time) and the `Ref`
+    # at run time) and the `Ref`, set once it exists if it is being serialized (field 2's second leaf)
     o = x.obj
+    if o in img.inprogress
+        push!(back, (first(l.fields[2]), o, typeof(o)))
+        return (code, Inst[Inst(:i64_const, owner_address(image_hash(img, o))), Inst(:ref_null, ts.jlvalue)])
+    end
     objg = object_global!(img, o)
     return (code, Inst[Inst(:i64_const, owner_address(image_hash(img, o))), Inst(:global_get, objg)])
 end
