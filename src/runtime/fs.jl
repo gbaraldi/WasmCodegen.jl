@@ -1056,17 +1056,26 @@ function refill!(st::IOS)
     return got > 0
 end
 
-# `ios_read`/`ios_readall` into the pointer `dest`: as ios.c's `_ios_read`
-function ios_read_to(st::IOS, dest::Ptr{UInt8}, n::Int, all::Bool)
+# the `k` buffered bytes at the read position to `dest`, after its first `tot` bytes: one
+# `array.copy` into a memory of bytes the code generator knew, else byte by byte
+function copy_buffered!(dest::Ptr{UInt8}, st::IOS, tot::Int, k::Int)
+    for j in 1:k
+        unsafe_store!(dest, st.buf[st.bpos+j], tot + j)
+    end
+end
+copy_buffered!(dest::MemoryRef{UInt8}, st::IOS, tot::Int, k::Int) =
+    unsafe_copyto!(Core.memoryrefnew(dest, tot + 1, false), Core.memoryrefnew(st.buf.ref, st.bpos + 1, false), k)
+
+# `ios_read`/`ios_readall` into `dest` (a pointer, or a `MemoryRef` to the first byte): as
+# ios.c's `_ios_read`
+function ios_read_to(st::IOS, dest::Union{Ptr{UInt8},MemoryRef{UInt8}}, n::Int, all::Bool)
     tot = 0
     didread = false
     while n > 0
         avail = st.size - st.bpos
         if avail > 0
             k = min(avail, n)
-            for j in 1:k
-                unsafe_store!(dest, st.buf[st.bpos+j], tot + j)
-            end
+            copy_buffered!(dest, st, tot, k)
             st.bpos += k
             tot += k
             n -= k
@@ -1079,8 +1088,10 @@ function ios_read_to(st::IOS, dest::Ptr{UInt8}, n::Int, all::Bool)
     return tot
 end
 
-ios_readall(s::Ptr{Cvoid}, dest::Ptr{Cvoid}, n::Csize_t) = Csize_t(ios_read_to(ios_state(s), Ptr{UInt8}(dest), Int(n), true))
-ios_read(s::Ptr{Cvoid}, dest::Ptr{Cvoid}, n::Csize_t) = Csize_t(ios_read_to(ios_state(s), Ptr{UInt8}(dest), Int(n), false))
+bytes_dest(dest::Ptr{Cvoid}) = Ptr{UInt8}(dest)
+bytes_dest(dest::MemoryRef{UInt8}) = dest
+ios_readall(s::Ptr{Cvoid}, dest::Union{Ptr{Cvoid},MemoryRef{UInt8}}, n::Csize_t) = Csize_t(ios_read_to(ios_state(s), bytes_dest(dest), Int(n), true))
+ios_read(s::Ptr{Cvoid}, dest::Union{Ptr{Cvoid},MemoryRef{UInt8}}, n::Csize_t) = Csize_t(ios_read_to(ios_state(s), bytes_dest(dest), Int(n), false))
 
 "`ios_fillbuf`: the bytes buffered if that is the rest of the file, else -1."
 function ios_fillbuf(s::Ptr{Cvoid})
