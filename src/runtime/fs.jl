@@ -1232,8 +1232,15 @@ function ios_pos(s::Ptr{Cvoid})
     p = seek_fd(st.fd, Int64(0), UInt32(1))
     return p < 0 ? p : p - (st.size - st.bpos)
 end
-# seek to `off` (`whence`), the read buffer given up once it succeeded
+# seek to `off` (`whence`), the read buffer given up once it succeeded; a skip (`whence` 1)
+# inside the read buffer moves in it instead, as ios.c's `ios_skip` (the fd stays at the
+# buffer's end, no call of the host)
 function seek_to!(st::IOS, off::Int64, whence::UInt32)
+    if whence == 1 && -st.bpos <= off <= st.size - st.bpos
+        off < 0 && (st.eof = false)
+        st.bpos += Int(off)
+        return Int64(0)
+    end
     if whence == 1
         p = seek_fd(st.fd, Int64(0), UInt32(1))
         p < 0 && return Int64(-1)
