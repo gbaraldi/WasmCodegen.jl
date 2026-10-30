@@ -32,5 +32,13 @@ WasmCodegen.with_trim_patches() do _, _
     include("image_pointers.jl")
     include("vararg_tuples.jl")
     include("versions.jl")
+    include("staging.jl")
+    include("env.jl")
+    include("fs.jl")
+    include("regex.jl")
+    include("event.jl")
     include("juliac/runtests.jl")
 end
+
+# sessions with project patches, outside the session above
+include("patch_sessions.jl")

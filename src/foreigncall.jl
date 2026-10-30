@@ -17,10 +17,76 @@ function foreigncall_name(@nospecialize(x))
     return nothing
 end
 
+# the library of a foreign call `ccall((name, library), ...)` given as a constant string, in
+# the forms `foreigncall_name` accepts
+function foreigncall_library(@nospecialize(x))
+    x isa QuoteNode && (x = x.value)
+    x isa Tuple && return length(x) == 2 && x[2] isa String ? x[2] : nothing
+    x isa GlobalRef && isconst(x.mod, x.name) && return foreigncall_library(getglobal(x.mod, x.name))
+    lib = if x isa Expr && x.head === :call && length(x.args) == 3 && x.args[1] === Core.tuple
+        # `Core.tuple(name, library)` (Julia 1.12)
+        x.args[3]
+    elseif x isa Expr && x.head === :tuple && length(x.args) == 2
+        # (name, library) (Julia 1.13)
+        x.args[2]
+    else
+        nothing
+    end
+    lib isa QuoteNode && (lib = lib.value)
+    return lib isa String ? lib : nothing
+end
+
+"The libraries whose functions are the host's: a `ccall` of one is a call of a Wasm import."
+const IMPORT_LIBRARIES = ("wasi_snapshot_preview1", "julia_regex", "julia_io")
+
+# the types of the arguments and results of host imports
+const IMPORT_SCALARS = (Int32, UInt32, Int64, UInt64)
+
+"""
+    emit_import_ccall!(fc, lib, name, ex, args, typ) -> CGVal
+
+`ccall((name, lib), RT, (ArgT...), args...)` of a host library: a call of the Wasm import
+`lib.name`. The types must be 32- and 64-bit integers (or `Cvoid` for no result). WASI's
+functions are imported only by modules for WASI (`Config(host = :wasi)`), which have the
+linear memory their pointers address.
+"""
+function emit_import_ccall!(fc::FnCtx, lib::String, name::Symbol, ex::Expr, args::Vector{Any})
+    # (an extension of the host: only for a module that asks for it)
+    lib == "julia_regex" && !(fc.cgm.config.host === :wasi && :julia_regex in fc.cgm.config.host_extensions) &&
+        unsupported("Regex (PCRE2): it runs on the host's regex engine, the `julia_regex` imports ",
+                    "(`js/julia_regex.mjs`), for `Config(host = :wasi, host_extensions = [:julia_regex])`")
+    lib == "julia_io" && !(fc.cgm.config.host === :wasi && :julia_io in fc.cgm.config.host_extensions) &&
+        unsupported("the host's events (`sleep`, HTTP, decompression: the `julia_io` import ", name,
+                    ", `js/julia_io.mjs`), for `Config(host = :wasi, host_extensions = [:julia_io])`")
+    lib == "wasi_snapshot_preview1" && fc.cgm.config.host !== :wasi &&
+        unsupported("the WASI function ", name, " in a module for JavaScript (file IO, the environment and ",
+                    "the like need `Config(host = :wasi)`)")
+    RT = ex.args[2]
+    ATs = ex.args[3]::Core.SimpleVector
+    bad = filter(T -> !(T in IMPORT_SCALARS), collect(Any, ATs))
+    (RT === Cvoid || RT in IMPORT_SCALARS) && isempty(bad) ||
+        error("WasmCodegen: the host import $lib.$name has a type other than Int32, UInt32, Int64, " *
+              "UInt64 (or Cvoid as its result): $RT ($(join(ATs, ", ")))")
+    # (its pointers are offsets of the runtime's part of the memory: `Runtime.Staging`)
+    lib in IMPORT_LIBRARIES && staging_memory!(fc.cgm)
+    wt(T) = sizeof(T) == 8 ? I64 : I32
+    params = ValType[wt(T) for T in ATs]
+    results = RT === Cvoid ? ValType[] : ValType[wt(RT)]
+    for (a, T) in zip(args, ATs)
+        push_val!(fc, convert_repr(fc, a::CGVal, T))
+    end
+    call!(fc.b, add_import!(fc.cgm.mod, lib, String(name), params, results))
+    return RT === Cvoid ? ghost(Nothing, nothing) : pop_val!(fc, RT)
+end
+
 function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     name = foreigncall_name(ex.args[1])
     nargs = length(ex.args[3]::Core.SimpleVector)
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
+    lib = foreigncall_library(ex.args[1])
+    if lib !== nothing && lib in IMPORT_LIBRARIES && name !== nothing
+        return emit_import_ccall!(fc, lib, name, ex, args)
+    end
     if name === nothing && is_llvmcall(ex.args[5])
         iname = llvm_intrinsic_name(ex.args[1])
         iname === nothing || return emit_llvm_intrinsic!(fc, iname, args, typ)
@@ -498,6 +564,90 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     :jl_strtof_c => RuntimeCcall(Runtime.Floats.strtof, [:val, :val]),
     :jl_try_substrtod => RuntimeCcall(Runtime.Floats.try_substrtod, [:val, :val, :val]),
     :jl_try_substrtof => RuntimeCcall(Runtime.Floats.try_substrtof, [:val, :val, :val]),
+    # the filesystem, for WASI (`runtime/fs.jl`)
+    :jl_stat => RuntimeCcall(Runtime.FS.jl_stat, [:val, :val]),
+    :jl_lstat => RuntimeCcall(Runtime.FS.jl_lstat, [:val, :val]),
+    :jl_fstat => RuntimeCcall(Runtime.FS.jl_fstat, [:val, :val]),
+    :jl_sizeof_stat => RuntimeCcall(Runtime.FS.jl_sizeof_stat, Symbol[]),
+    :jl_stat_dev => RuntimeCcall(Runtime.FS.stat_dev, [:val]),
+    :jl_stat_ino => RuntimeCcall(Runtime.FS.stat_ino, [:val]),
+    :jl_stat_mode => RuntimeCcall(Runtime.FS.stat_mode, [:val]),
+    :jl_stat_nlink => RuntimeCcall(Runtime.FS.stat_nlink, [:val]),
+    :jl_stat_uid => RuntimeCcall(Runtime.FS.stat_uid, [:val]),
+    :jl_stat_gid => RuntimeCcall(Runtime.FS.stat_gid, [:val]),
+    :jl_stat_rdev => RuntimeCcall(Runtime.FS.stat_rdev, [:val]),
+    :jl_stat_size => RuntimeCcall(Runtime.FS.stat_size, [:val]),
+    :jl_stat_blksize => RuntimeCcall(Runtime.FS.stat_blksize, [:val]),
+    :jl_stat_blocks => RuntimeCcall(Runtime.FS.stat_blocks, [:val]),
+    :jl_stat_mtime => RuntimeCcall(Runtime.FS.stat_mtime, [:val]),
+    :jl_stat_ctime => RuntimeCcall(Runtime.FS.stat_ctime, [:val]),
+    :malloc => RuntimeCcall(Runtime.FS.malloc, [:val]),
+    :free => RuntimeCcall(Runtime.FS.free, [:val]),
+    :uv_fs_req_cleanup => RuntimeCcall(Runtime.FS.req_cleanup, [:val]),
+    :uv_fs_mkdir => RuntimeCcall(Runtime.FS.uv_fs_mkdir, [:val, :val, :val, :val, :val]),
+    :uv_fs_rmdir => RuntimeCcall(Runtime.FS.uv_fs_rmdir, [:val, :val, :val, :val]),
+    :jl_fs_unlink => RuntimeCcall(Runtime.FS.jl_fs_unlink, [:val]),
+    :jl_fs_rename => RuntimeCcall(Runtime.FS.jl_fs_rename, [:val, :val]),
+    :jl_fs_symlink => RuntimeCcall(Runtime.FS.jl_fs_symlink, [:val, :val, :val]),
+    :jl_fs_hardlink => RuntimeCcall(Runtime.FS.jl_fs_hardlink, [:val, :val]),
+    :jl_fs_chmod => RuntimeCcall(Runtime.FS.jl_fs_chmod, [:val, :val]),
+    :jl_fs_access => RuntimeCcall(Runtime.FS.jl_fs_access, [:val, :val]),
+    :uv_os_getpid => RuntimeCcall(Runtime.FS.getpid, Symbol[]),
+    :uv_fs_open => RuntimeCcall(Runtime.FS.uv_fs_open, [:val, :val, :val, :val, :val, :val]),
+    :uv_fs_get_result => RuntimeCcall(Runtime.FS.uv_fs_get_result, [:val]),
+    :jl_fs_close => RuntimeCcall(Runtime.FS.jl_fs_close, [:val]),
+    :jl_fs_write => RuntimeCcall(Runtime.FS.jl_fs_write, [:val, :val, :val, :val]),
+    :jl_fs_read => RuntimeCcall(Runtime.FS.jl_fs_read, [:val, :val, :val]),
+    :jl_fs_sendfile => RuntimeCcall(Runtime.FS.jl_fs_sendfile, [:val, :val, :val, :val]),
+    :jl_lseek => RuntimeCcall(Runtime.FS.jl_lseek, [:val, :val, :val]),
+    :ios_fd => RuntimeCcall(Runtime.FS.ios_fd, [:val, :val, :val, :val]),
+    :uv_fs_ftruncate => RuntimeCcall(Runtime.FS.uv_fs_ftruncate, [:val, :val, :val, :val, :val]),
+    :uv_fs_futime => RuntimeCcall(Runtime.FS.uv_fs_futime, [:val, :val, :val, :val, :val, :val]),
+    :futimes => RuntimeCcall(Runtime.FS.futimes, [:val, :val]),
+    :jl_ios_buffer_n => RuntimeCcall(Runtime.FS.jl_ios_buffer_n, [:val, :val]),
+    :jl_ios_get_nbyte_int => RuntimeCcall(Runtime.FS.jl_ios_get_nbyte_int, [:val, :val]),
+    # the IO streams of files (`IOStream`)
+    :ios_file => RuntimeCcall(Runtime.FS.ios_file, [:val, :val, :val, :val, :val, :val]),
+    :ios_readall => RuntimeCcall(Runtime.FS.ios_readall, [:val, :val, :val]),
+    :ios_read => RuntimeCcall(Runtime.FS.ios_read, [:val, :val, :val]),
+    :ios_fillbuf => RuntimeCcall(Runtime.FS.ios_fillbuf, [:val]),
+    :jl_nb_available => RuntimeCcall(Runtime.FS.jl_nb_available, [:val]),
+    :ios_getc => RuntimeCcall(Runtime.FS.ios_getc, [:val]),
+    :ios_peekc => RuntimeCcall(Runtime.FS.ios_peekc, [:val]),
+    :ios_eof_blocking => RuntimeCcall(Runtime.FS.ios_eof_blocking, [:val]),
+    :ios_write => RuntimeCcall(Runtime.FS.ios_write, [:val, :val, :val]),
+    :ios_putc => RuntimeCcall(Runtime.FS.ios_putc, [:val, :val]),
+    :ios_flush => RuntimeCcall(Runtime.FS.ios_flush, [:val]),
+    :ios_isopen => RuntimeCcall(Runtime.FS.ios_isopen, [:val]),
+    :ios_get_readable => RuntimeCcall(Runtime.FS.ios_get_readable, [:val]),
+    :ios_get_writable => RuntimeCcall(Runtime.FS.ios_get_writable, [:val]),
+    :jl_ios_fd => RuntimeCcall(Runtime.FS.jl_ios_fd, [:val]),
+    :ios_close => RuntimeCcall(Runtime.FS.ios_close, [:val]),
+    :ios_pos => RuntimeCcall(Runtime.FS.ios_pos, [:val]),
+    :ios_seek => RuntimeCcall(Runtime.FS.ios_seek, [:val, :val]),
+    :ios_seek_end => RuntimeCcall(Runtime.FS.ios_seek_end, [:val]),
+    :ios_skip => RuntimeCcall(Runtime.FS.ios_skip, [:val, :val]),
+    :ios_filesize => RuntimeCcall(Runtime.FS.ios_filesize, [:val]),
+    :ios_trunc => RuntimeCcall(Runtime.FS.ios_trunc, [:val, :val]),
+    :jl_readuntil => RuntimeCcall(Runtime.FS.jl_readuntil, [:val, :val, :val, :val]),
+    # PCRE2 (Base's `Regex`): the host's regex engine (`julia_regex` imports, `runtime/regex.jl`)
+    :pcre2_compile_8 => RuntimeCcall(Runtime.HostRegex.compile, [:val, :val, :val, :val, :val, :val]),
+    :pcre2_jit_compile_8 => RuntimeCcall(Runtime.HostRegex.jit_compile, [:val, :val]),
+    :pcre2_code_free_8 => RuntimeCcall(Runtime.HostRegex.code_free, [:val]),
+    :pcre2_pattern_info_8 => RuntimeCcall(Runtime.HostRegex.pattern_info, [:val, :val, :val]),
+    :pcre2_substring_number_from_name_8 => RuntimeCcall(Runtime.HostRegex.substring_number_from_name, [:val, :val]),
+    :pcre2_match_data_create_from_pattern_8 => RuntimeCcall(Runtime.HostRegex.match_data_create, [:val, :val]),
+    :pcre2_match_data_free_8 => RuntimeCcall(Runtime.HostRegex.match_data_free, [:val]),
+    :pcre2_get_ovector_pointer_8 => RuntimeCcall(Runtime.HostRegex.ovector_pointer, [:val]),
+    :pcre2_get_ovector_count_8 => RuntimeCcall(Runtime.HostRegex.ovector_count, [:val]),
+    :pcre2_match_8 => RuntimeCcall(Runtime.HostRegex.match, [:val, :val, :val, :val, :val, :val, :val]),
+    :pcre2_substring_length_bynumber_8 => RuntimeCcall(Runtime.HostRegex.substring_length_bynumber, [:val, :val, :val]),
+    :pcre2_substring_copy_bynumber_8 => RuntimeCcall(Runtime.HostRegex.substring_copy_bynumber, [:val, :val, :val, :val]),
+    :pcre2_get_error_message_8 => RuntimeCcall(Runtime.HostRegex.get_error_message, [:val, :val, :val]),
+    # the environment, for WASI (`runtime/env.jl`)
+    :getenv => RuntimeCcall(Runtime.Env.getenv, [:val]),
+    :setenv => RuntimeCcall(Runtime.Env.setenv, [:val, :val, :val]),
+    :unsetenv => RuntimeCcall(Runtime.Env.unsetenv, [:val]),
     :jl_set_errno => RuntimeCcall(Runtime.Floats.set_errno, [:val]),
     :jl_errno => RuntimeCcall(Runtime.Floats.get_errno, Symbol[]),
     # C strings: the bytes before a NUL (a string's or symbol's end)

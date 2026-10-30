@@ -1,11 +1,14 @@
 // Persistent runner: NDJSON requests on stdin, one response per line.
-// {id, wasm (base64) | wasmId, fn, args: [{t, bits}], results: [t...]}
+// {id, wasm (base64) | wasmId, fn, args: [{t, bits}], results: [t...], wasi?: {env, args, preopens}}
+// (a request with `wasi` options runs a new instance of a WASI module, with those options)
 import { createInterface } from 'node:readline';
 import { WASI } from 'node:wasi';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHost } from '../js/julia.mjs';
+import { makeJuliaRegex } from '../js/julia_regex.mjs';
+import { makeJuliaIOPaths, makeJuliaIOEvents, PATH_IMPORTS, EVENT_IMPORTS } from '../js/julia_io.mjs';
 const modules = new Map();
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let output = '';
@@ -16,16 +19,82 @@ const wasiOut = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wasmcodegen-'))
 const wasiOutFd = fs.openSync(wasiOut, 'a+');
 // a module compiled with `Config(host = :js)` runs with js/julia.mjs; one compiled with
 // `host = :wasi` (it exports its memory) with Node's WASI, as a WASI runtime runs it
-async function instantiate(mod) {
+async function instantiate(mod, opts = {}) {
   const imports = WebAssembly.Module.imports(mod);
   if (WebAssembly.Module.exports(mod).some((e) => e.name === 'memory' && e.kind === 'memory')) {
+    // (and the host's regex engine, for `host_extensions = [:julia_regex]`, and its events,
+    // file modes and links, for `[:julia_io]`: the events only for a module that imports
+    // them, whose calls may suspend)
+    const regex = makeJuliaRegex();
+    const io = imports.filter((imp) => imp.module === 'julia_io').map((imp) => imp.name);
     for (const imp of imports) {
+      if (imp.module === 'julia_regex' && imp.name in regex.imports) continue;
+      if (imp.module === 'julia_io' && (PATH_IMPORTS.includes(imp.name) || EVENT_IMPORTS.includes(imp.name))) continue;
       if (imp.module !== 'wasi_snapshot_preview1') throw new Error('not a WASI import: ' + imp.module + '.' + imp.name);
     }
-    const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true });
-    const inst = await WebAssembly.instantiate(mod, wasi.getImportObject());
+    // (the adapter's paths are the module's: the preopens at the same path)
+    const preopens = Object.entries(opts.preopens ?? {}).filter(([g, h]) => g === h).map(([g]) => g);
+    const paths = io.some((n) => PATH_IMPORTS.includes(n)) ? makeJuliaIOPaths({ preopens }) : null;
+    const events = io.some((n) => EVENT_IMPORTS.includes(n)) ? makeJuliaIOEvents({ preopens }) : null;
+    const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true,
+                            env: opts.env ?? {}, args: opts.args ?? [], preopens: opts.preopens ?? {} });
+    const host = wasi.getImportObject();
+    host.julia_regex = regex.imports;
+    host.julia_io = { ...paths?.imports, ...events?.imports };
+    let inst;
+    // Faults are opt-in and scoped to this instance. Normal tests use the host directly.
+    for (const name of new Set((opts.faults ?? []).map((r) => r.call))) {
+      const original = host.wasi_snapshot_preview1[name];
+      let calls = 0;
+      host.wasi_snapshot_preview1[name] = (...args) => {
+        const rules = opts.faults.filter((r) => r.call === name &&
+          (!r.negativeSeek || (args[1] < 0n && args[2] === 1)));
+        if (!rules.length) return original(...args);
+        calls++;
+        if (calls > 32 && rules.some((r) => r.repeat)) throw new Error('fault host: no progress');
+        const rule = rules.find((r) => r.at === calls || (r.repeat && calls >= r.at));
+        if (!rule) return original(...args);
+        if (rule.errno !== undefined) return rule.errno;
+        const memory = new DataView(inst.exports.memory.buffer);
+        if (rule.maxBytes !== undefined) {
+          const old = memory.getUint32(args[1] + 4, true);
+          memory.setUint32(args[1] + 4, Math.min(old, rule.maxBytes), true);
+          try { return original(...args); }
+          finally { memory.setUint32(args[1] + 4, old, true); }
+        }
+        if (rule.linkLength !== undefined) {
+          const count = Math.min(args[4], rule.linkLength);
+          new Uint8Array(inst.exports.memory.buffer, args[3], count).fill(97);
+          memory.setUint32(args[5], count, true);
+          return 0;
+        }
+        if (rule.dirents) {
+          if (rule.cookie !== undefined && args[3] !== BigInt(rule.cookie))
+            throw new Error('unexpected directory cookie: ' + args[3]);
+          const records = [];
+          for (const ent of rule.dirents) {
+            const record = Buffer.alloc(24 + ent.length, 97);
+            record.writeBigUInt64LE(BigInt(ent.next), 0);
+            record.writeBigUInt64LE(1n, 8);
+            record.writeUInt32LE(ent.length, 16);
+            record[20] = 4;
+            records.push(record);
+          }
+          const data = Buffer.concat(records);
+          const used = Math.min(args[2], data.length);
+          new Uint8Array(inst.exports.memory.buffer, args[1], used).set(data.subarray(0, used));
+          memory.setUint32(args[4], used, true);
+          return 0;
+        }
+        throw new Error('unknown fault rule');
+      };
+    }
+    inst = await WebAssembly.instantiate(mod, host);
+    regex.bindMemory(inst.exports.memory);
+    paths?.bindMemory(inst.exports.memory);
+    events?.bindMemory(inst.exports.memory);
     wasi.initialize(inst);
-    return inst;
+    return { inst, suspends: events !== null };
   }
   const host = createHost({ write: (fd, b) => { for (const x of b) bytes.push(x); } });
   for (const imp of imports) {
@@ -33,7 +102,7 @@ async function instantiate(mod) {
   }
   const inst = await WebAssembly.instantiate(mod, { julia: host.imports.julia });
   host.attach(inst);
-  return inst;
+  return { inst, suspends: false };
 }
 function takeOutput() {
   output += decoder.decode(new Uint8Array(bytes));
@@ -65,19 +134,21 @@ rl.on('line', async (line) => {
   if (!line.trim()) return;
   const req = JSON.parse(line);
   try {
-    let inst = modules.get(req.wasmId);
-    if (!inst) {
+    const key = req.wasi ? req.wasmId + JSON.stringify(req.wasi) : req.wasmId;
+    let m = req.wasi ? undefined : modules.get(key);
+    if (!m) {
       const bytes = Buffer.from(req.wasm, 'base64');
       const mod = await WebAssembly.compile(bytes, { builtins: ['js-string'] });
-      inst = await instantiate(mod);
-      modules.set(req.wasmId, inst);
+      m = await instantiate(mod, req.wasi);
+      req.wasi || modules.set(key, m);
     }
     takeOutput();
-    const f = inst.exports[req.fn];
+    const f = m.inst.exports[req.fn];
     if (!f) throw new Error('no export ' + req.fn);
     let r;
     try {
-      r = f(...req.args.map(decode));
+      // (an export that may suspend, on the host's events, returns a promise)
+      r = m.suspends ? await WebAssembly.promising(f)(...req.args.map(decode)) : f(...req.args.map(decode));
     } catch (e) {
       process.stdout.write(JSON.stringify({ id: req.id, trap: String(e && e.message || e), output: takeOutput() }) + '\n');
       return;
