@@ -70,7 +70,7 @@ end
 "The elements of the tuple value `t`."
 function tuple_elements(fc::FnCtx, t::CGVal)
     T = t.typ
-    (T isa DataType && T <: Tuple && isconcretetype(T)) ||
+    (T isa DataType && T <: Tuple && (isconcretetype(T) || is_erased_tuple(T))) ||
         unsupported("the elements of a tuple of type ", T)
     return CGVal[get_field(fc, t, i) for i in 1:fieldcount(T)]
 end
