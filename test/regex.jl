@@ -91,7 +91,13 @@ end
 # errors: messages as natively for syntax errors
 function errors()
     io = IOBuffer()
-    for p in ("(", "a)", "[a", "a{2,1}", "*a", "\\", "\\i", "[z-a]", "(?<a>x)(?<a>y)", "\\k<nope>", "[[:foo:]]")
+    # PCRE2 10.47 reports the end of the offending token. Multibyte prefixes and
+    # range endpoints check that the translator converts code points to byte offsets.
+    for p in ("(", "a)", "é)", "[a", "a{2,1}", "a{999999}", "*a", "+a", "?a", "{2}a",
+              "a**", "a{2}*", "a*+?", "^*", "é**", "\\", "\\i", "é\\i", "[\\i]", "[\\R]",
+              "[z-a]", "[é-a]", "[z-\\x61]", "[z-\\Qab\\E]", "[𐀀-\\Qéa\\E]",
+              "[\\x7a-a]", "[z-\\cA]", "[z-\\n]", "[z-\\d]", "[\\d-a]", "\\cĀ", "[\\cĀ]",
+              "(?<a>x)(?<a>y)", "\\k<nope>", "[[:foo:]]")
         try
             Regex(p)
             print(io, p); println(io, ": compiled")
@@ -157,6 +163,9 @@ using .RegexTests: RegexTests as RX
     wcompile(f, at) = WasmCodegen.compile(f, at; config=cfg)
     for (f, g) in ((RX.api, RX.api_print), (RX.errors, RX.errors_print), (RX.semver, RX.semver_print), (RX.tar, RX.tar_print))
         expected = f()
+        if f === RX.errors
+            @test !occursin(": compiled", expected)
+        end
         r = wasm_run(wcompile(g, ()), string(nameof(g)); rettype=Int32)
         @test r == 0
         @test LAST_OUTPUT[] == expected

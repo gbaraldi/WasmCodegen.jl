@@ -1,6 +1,6 @@
 // The host's regex engine for WasmCodegen modules: the `julia_regex` imports (version 1).
 //
-// Julia's `Regex` is PCRE2 (10.46 in Julia 1.13). In Wasm, Base's `pcre2_*_8` foreign calls are
+// Julia's `Regex` is PCRE2 (10.47 in Julia 1.13). In Wasm, Base's `pcre2_*_8` foreign calls are
 // implemented by WasmCodegen's runtime (`src/runtime/regex.jl`) on top of these imports, which
 // run the pattern on V8's `RegExp` after translating it from PCRE2 syntax and semantics to an
 // ECMAScript `v`-mode pattern. The translator is exact for what it accepts and rejects what it
@@ -32,7 +32,7 @@
 // | `free` | `(h) -> i32 status` | Drops one reference to the handle; `EBADF` if unknown. (Base frees patterns in finalizers, which do not run in the module.) |
 // | `errmsg` | `(out_off, cap) -> i32 len` | The last error message (UTF-8, truncated to `cap`), and its length. |
 //
-// **Semantics contract.** The host matches **as PCRE2 10.46 with Unicode 16** would for every
+// **Semantics contract.** The host matches **as PCRE2 10.47 with Unicode 16** would for every
 // pattern it accepts: the same match, the same captures, the same offsets, for Base's default options
 // (`UTF | UCP | MATCH_INVALID_UTF | ALT_BSUX`, match `NO_UTF_CHECK`) and the `a/i/m/s/x` flags. A
 // pattern it cannot match that way it rejects (code 900, a message naming the construct); it never
@@ -52,7 +52,7 @@ export const JULIA_REGEX_VERSION = 1;
 // WASI errnos used here
 export const E = Object.freeze({ BADF: 8, INVAL: 28, IO: 29, NOBUFS: 42, NOTSUP: 58 });
 
-// PCRE2 option bits (pcre2.h, 10.46), as Base passes them
+// PCRE2 option bits (pcre2.h, 10.47), as Base passes them
 export const PCRE = Object.freeze({
   // compile options
   ALLOW_EMPTY_CLASS: 0x1, ALT_BSUX: 0x2, AUTO_CALLOUT: 0x4, CASELESS: 0x8, DOLLAR_ENDONLY: 0x10,
@@ -80,7 +80,7 @@ export const ERR = Object.freeze({
   DUPLICATE_SUBPATTERN_NAME: 143, INVALID_SUBPATTERN_NAME: 144, MALFORMED_UNICODE_PROPERTY: 146,
   UNKNOWN_UNICODE_PROPERTY: 147, CLASS_INVALID_RANGE: 150, BACKSLASH_O_MISSING_BRACE: 155,
   BACKSLASH_G_SYNTAX: 157, SUBPATTERN_NAME_EXPECTED: 162, INVALID_HEXADECIMAL: 167,
-  BACKSLASH_K_SYNTAX: 169, BACKSLASH_N_IN_CLASS: 171, UTF8_ERROR: 173,
+  BACKSLASH_C_SYNTAX: 168, BACKSLASH_K_SYNTAX: 169, BACKSLASH_N_IN_CLASS: 171, UTF8_ERROR: 173,
   INVALID_HYPHEN_IN_OPTIONS: 194, LOOKBEHIND_BRANCH_TOO_LONG: 200, LOOKBEHIND_TOO_LONG: 187,
   POSIX_NO_SUPPORT_COLLATING: 113, PATTERN_TOO_LARGE: 120,
   // ours: valid PCRE2 that the translator does not handle (fails loudly)
@@ -118,6 +118,7 @@ const MESSAGES = {
   [ERR.BACKSLASH_G_SYNTAX]: '\\g is not followed by a braced, angle-bracketed, or quoted name/number or by a plain number',
   [ERR.SUBPATTERN_NAME_EXPECTED]: 'subpattern name expected',
   [ERR.INVALID_HEXADECIMAL]: 'non-hex character in \\x{} (closing brace missing?)',
+  [ERR.BACKSLASH_C_SYNTAX]: '\\c must be followed by a printable ASCII character',
   [ERR.BACKSLASH_K_SYNTAX]: '\\k is not followed by a braced, angle-bracketed, or quoted name',
   [ERR.BACKSLASH_N_IN_CLASS]: '\\N is not supported in a class',
   [ERR.UTF8_ERROR]: 'UTF-8 error in the pattern',
@@ -303,7 +304,7 @@ class Parser {
   parse() {
     this.parseVerbs();
     const ast = this.parseAlt();
-    if (!this.eof()) throw this.err(ERR.UNMATCHED_CLOSING_PARENTHESIS);
+    if (!this.eof()) throw this.err(ERR.UNMATCHED_CLOSING_PARENTHESIS, this.pos + 1);
     for (const b of this.backrefs) {
       if (b.name !== undefined) {
         const n = this.names.get(b.name);
@@ -378,7 +379,7 @@ class Parser {
     const at = this.pos;
     const q = this.parseQuantifier();
     if (q === null) return atom;
-    if (NOT_REPEATABLE.has(atom.t)) throw this.err(ERR.QUANTIFIER_INVALID, at);
+    if (NOT_REPEATABLE.has(atom.t)) throw this.err(ERR.QUANTIFIER_INVALID, this.pos);
     let greedy = true, possessive = false;
     this.skipIgnorable();
     if (this.isChar('+')) { possessive = true; this.pos++; }
@@ -386,8 +387,7 @@ class Parser {
     if (this.opts.U && !possessive) greedy = !greedy;
     atom = { t: 'quant', body: atom, min: q.min, max: q.max, greedy, possessive, at };
     this.skipIgnorable();
-    const at2 = this.pos;
-    if (this.parseQuantifier() !== null) throw this.err(ERR.QUANTIFIER_INVALID, at2);
+    if (this.parseQuantifier() !== null) throw this.err(ERR.QUANTIFIER_INVALID, this.pos);
     return atom;
   }
 
@@ -432,10 +432,10 @@ class Parser {
       case 0x24: return { t: 'eol', m: this.opts.m };              // $
       case 0x5c: return this.parseEscape(at, items);               // \
       case 0x2a: case 0x2b: case 0x3f:
-        throw this.err(ERR.QUANTIFIER_INVALID, at);
+        throw this.err(ERR.QUANTIFIER_INVALID, this.pos);
       case 0x7b:
         this.pos = at;
-        if (this.parseQuantifier() !== null) throw this.err(ERR.QUANTIFIER_INVALID, at);
+        if (this.parseQuantifier() !== null) throw this.err(ERR.QUANTIFIER_INVALID, this.pos);
         this.pos = at + 1;
         return this.lit(c);
       default: return this.lit(c);
@@ -666,7 +666,7 @@ class Parser {
       this.pos = at + 1;
       return this.lit(this.octal(at));
     }
-    if (isAlnumAscii(c)) throw this.err(ERR.UNKNOWN_ESCAPE, at + 1);
+    if (isAlnumAscii(c)) throw this.err(ERR.UNKNOWN_ESCAPE, this.pos);
     return this.lit(c);
   }
 
@@ -735,7 +735,7 @@ class Parser {
       case 'c': {
         const x = this.peek();
         if (x === undefined) throw this.err(ERR.END_BACKSLASH_C, this.pos);
-        if (x > 0x7f) throw this.err(ERR.UNKNOWN_ESCAPE, at);
+        if (x < 0x20 || x > 0x7e) throw this.err(ERR.BACKSLASH_C_SYNTAX, this.pos + 1);
         this.pos++;
         const up = x >= 0x61 && x <= 0x7a ? x - 0x20 : x;
         return up ^ 0x40;
@@ -869,8 +869,8 @@ class Parser {
       const hi = this.classAtom(at);
       if (hi === null) throw new Error('internal: a transparent class token after a range hyphen');
       if (hi.k === 'chars') {
-        // (PCRE2 reports a quoted end at its character)
-        if (hi.cps[0] < lo.cp) throw this.err(ERR.CLASS_RANGE_ORDER, qAt);
+        // PCRE2 10.47 reports the offset after the first quoted character.
+        if (hi.cps[0] < lo.cp) throw this.err(ERR.CLASS_RANGE_ORDER, qAt + 1);
         items.push({ k: 'range', lo: lo.cp, hi: hi.cps[0] });
         // the rest as members, the last of them able to start a range (`[a-\Qbe\E-g]`)
         if (hi.cps.length > 1) carry = { k: 'chars', cps: hi.cps.slice(1) };
@@ -878,8 +878,8 @@ class Parser {
       }
       // [a-\d]: PCRE2 errors (10.43+: invalid range)
       if (hi.k !== 'char') throw this.err(ERR.CLASS_INVALID_RANGE, this.pos);
-      // (at the end's last character: `[z-\x61]` at the 1)
-      if (hi.cp < lo.cp) throw this.err(ERR.CLASS_RANGE_ORDER, quoted ? qAt : this.pos - 1);
+      // The error offset follows the complete range endpoint, including escapes.
+      if (hi.cp < lo.cp) throw this.err(ERR.CLASS_RANGE_ORDER, quoted ? qAt + 1 : this.pos);
       items.push({ k: 'range', lo: lo.cp, hi: hi.cp });
     }
     return { t: 'class', neg, items, i: this.opts.i };
@@ -936,8 +936,8 @@ class Parser {
     // (`\8` and `\9` are no octal escape: declined rather than guessed)
     if (e === 0x38 || e === 0x39) throw untranslatable(`the escape \\${ch} in a character class`, start);
     if (e >= 0x31 && e <= 0x37) { this.pos--; return { k: 'char', cp: this.octal(start) }; }
-    if (ch === 'R' || ch === 'X' || ch === 'B') throw this.err(ERR.ESCAPE_INVALID_IN_CLASS, start);
-    if (isAlnumAscii(e)) throw this.err(ERR.UNKNOWN_ESCAPE, start);
+    if (ch === 'R' || ch === 'X' || ch === 'B') throw this.err(ERR.ESCAPE_INVALID_IN_CLASS, this.pos);
+    if (isAlnumAscii(e)) throw this.err(ERR.UNKNOWN_ESCAPE, this.pos);
     return { k: 'char', cp: e };
   }
 }
