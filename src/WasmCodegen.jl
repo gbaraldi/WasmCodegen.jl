@@ -24,6 +24,8 @@ include("errors.jl")
 module Runtime
 include("runtime/int128.jl")
 include("runtime/io.jl")
+include("runtime/twins.jl")
+include("runtime/staging.jl")
 include("runtime/pointers.jl")
 include("runtime/libc.jl")
 include("runtime/reinterpret.jl")
