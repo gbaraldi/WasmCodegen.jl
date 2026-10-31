@@ -35,6 +35,36 @@ itself (a host call), or `nothing` for other calls.
 function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nospecialize(typ))
     m = mi.def
     m isa Method || return nothing
+    if m.module === Runtime.Staging && haskey(STAGING_OPS, m.name)
+        # a load or store of the linear memory (for WASI: see `staging.jl`), checked first as
+        # natively (a Julia error, not a trap)
+        fc.cgm.config.host === :wasi ||
+            unsupported("the linear memory (`Runtime.Staging`) in a module for JavaScript (`Config(host = :wasi)`)")
+        staging_memory!(fc.cgm)
+        op, T = STAGING_OPS[m.name]
+        args = CGVal[operand(fc, a) for a in ex.args[3:end]]
+        off = convert_repr(fc, args[1], UInt32)
+        call_runtime!(fc, Runtime.Staging.check, CGVal[off, const_value(fc, sizeof(T))])
+        push_val!(fc, off)
+        align = trailing_zeros(sizeof(T))
+        if length(args) == 1
+            emit!(fc.b, op, align, 0)
+            return pop_val!(fc, T)
+        end
+        push_val!(fc, convert_repr(fc, args[2], T))
+        emit!(fc.b, op, align, 0)
+        return ghost(Nothing, nothing)
+    end
+    F = mi.specTypes.parameters[1]
+    impl = Base.issingletontype(F) ? Runtime.wasm_impl(F.instance, fc.cgm.config.host_extensions) : nothing
+    if impl !== nothing
+        # a runtime function with a native twin, or one an extension of the host implements:
+        # its Wasm implementation (for the module's host)
+        args = CGVal[operand(fc, a) for a in ex.args[3:end]]
+        argtypes = Tuple(mi.specTypes.parameters[2:end])
+        args = CGVal[convert_repr(fc, a, T) for (a, T) in zip(args, argtypes)]
+        return call_runtime!(fc, impl, args)
+    end
     if m.module === Runtime.IO && m.name === :write_byte
         fd, b = CGVal[operand(fc, a) for a in ex.args[3:end]]
         push_val!(fc, convert_repr(fc, fd, Int32))
@@ -46,7 +76,10 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     elseif m.module === Runtime && m.name === :map_type
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
-    elseif m.module === Base && (m.name === :enq_work || (m.name === :wait && length(mi.specTypes.parameters) == 1))
+    elseif m.module === Runtime.Tasks && m.name in TASK_PRIMITIVES
+        return emit_task_primitive!(fc, m.name, mi, ex)
+    elseif fc.cgm.config.tasks === :none && m.module === Base &&
+           (m.name === :enq_work || (m.name === :wait && length(mi.specTypes.parameters) == 1))
         # one task: waiting can only wait forever, and there is no other task to schedule (in
         # place of the scheduler: task switches, the C runtime's queues and threads)
         msg = m.name === :wait ? "deadlock: waiting in a program of one task" : "scheduling a task in a program of one task"
@@ -81,4 +114,95 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
         return emit_reinterpret_bits!(fc, Out, operand(fc, ex.args[4]), In)
     end
     return nothing
+end
+
+# the loads and stores of `Runtime.Staging`: the instruction, and the type loaded or stored
+const STAGING_OPS = Dict{Symbol,Tuple{Symbol,Any}}(
+    :load8 => (:i32_load8_u, UInt8), :load16 => (:i32_load16_u, UInt16),
+    :load32 => (:i32_load, UInt32), :load64 => (:i64_load, UInt64),
+    :store8 => (:i32_store8, UInt8), :store16 => (:i32_store16, UInt16),
+    :store32 => (:i32_store, UInt32), :store64 => (:i64_store, UInt64))
+
+## tasks on JSPI stacks (`Config(tasks=:jspi)`, `Runtime.Tasks`)
+
+const TASK_PRIMITIVES = (:alloc_task, :set_current!, :entry_slot!, :call_entry, :get_exception,
+                         :set_exception!, :clear_exception!)
+
+# the type of the task bodies' runners, `run_body(::Task, ::Type{F})`: `(ref Task) -> ()`
+task_body_type!(cgm::CGModule) = functype!(cgm.mod, valtypes(cgm, Task), ValType[])
+
+# the module's table of task body runners: one slot for each type of task body (at most 65535,
+# the range of `Task.priority`, which holds a task's slot until it runs)
+function task_entries_global!(cgm::CGModule)
+    get!(cgm.helpers, :task_entries) do
+        ft = task_body_type!(cgm)
+        arr = add_type!(cgm.mod, ArrayType(FieldType(RefType(ft, true), true)))
+        g = add_global!(cgm.mod, "jl_task_entries", RefType(arr, false), false,
+                        Inst[Inst(:i32_const, 65536), Inst(:array_new_default, arr)])
+        (g, arr, ft)
+    end
+end
+
+function emit_task_primitive!(fc::FnCtx, name::Symbol, mi::Core.MethodInstance, ex::Expr)
+    cgm = fc.cgm
+    cgm.config.tasks === :jspi || unsupported("tasks (Runtime.Tasks) without Config(tasks=:jspi)")
+    args = CGVal[operand(fc, a) for a in ex.args[3:end]]
+    if name === :alloc_task
+        # a task, every field zero or null (as the root task's global before its fields are set)
+        ts = cgm.types
+        l = layout(ts, Task)
+        emit!(fc.b, :i32_const, typeid!(ts, Task))
+        emit!(fc.b, :i32_const, 0)
+        for f in (typedef(cgm.mod, l.wtype).comp::StructType).fields[HEADER_FIELDS+1:end]
+            st = f.storage
+            d = default_inst(st isa PackedType ? I32 : st)
+            emit!(fc.b, d.op, d.imm...)
+        end
+        emit!(fc.b, :struct_new, l.wtype)
+        return pop_val!(fc, Task)
+    elseif name === :set_current!
+        push_val!(fc, convert_repr(fc, args[1], Task))
+        emit!(fc.b, :ref_as_non_null)
+        emit!(fc.b, :global_set, current_task_global!(cgm))
+        return ghost(Nothing, nothing)
+    elseif name === :get_exception
+        # (the current exception is a global: a task switch keeps it in the switching frame)
+        if cgm.exceptions === :none
+            emit!(fc.b, :ref_null, cgm.types.jlvalue)
+        else
+            emit!(fc.b, :global_get, current_exception_global!(cgm))
+        end
+        return pop_val!(fc, Any)
+    elseif name === :set_exception! || name === :clear_exception!
+        cgm.exceptions === :none && return ghost(Nothing, nothing)
+        if name === :set_exception!
+            push_val!(fc, convert_repr(fc, args[1], Any))
+        else
+            emit!(fc.b, :ref_null, cgm.types.jlvalue)
+        end
+        emit!(fc.b, :global_set, current_exception_global!(cgm))
+        return ghost(Nothing, nothing)
+    elseif name === :entry_slot!
+        # the slot of `F`'s runner, given at compile time; the runner is stored there
+        F = mi.specTypes.parameters[2].parameters[1]
+        info = runtime_function!(cgm, Runtime.Tasks.run_body, (Task, Type{F}))
+        g, arr, ft = task_entries_global!(cgm)
+        info.func.type == ft || unsupported("a task body runner of type ", info.func.type, " (not ", ft, ")")
+        slots = get!(() -> IdDict{Any,Int32}(), cgm.helpers, :task_slots)::IdDict{Any,Int32}
+        slot = get!(slots, F, Int32(length(slots) + 1))
+        slot < 65536 || unsupported("more than 65535 types of task bodies")
+        emit!(fc.b, :global_get, g)
+        emit!(fc.b, :i32_const, slot)
+        emit!(fc.b, :ref_func, info.func)
+        emit!(fc.b, :array_set, arr)
+        return const_value(fc, slot)
+    else # :call_entry
+        g, arr, ft = task_entries_global!(cgm)
+        push_val!(fc, convert_repr(fc, args[2], Task))
+        emit!(fc.b, :global_get, g)
+        push_val!(fc, convert_repr(fc, args[1], Int32))
+        emit!(fc.b, :array_get, arr)
+        emit!(fc.b, :call_ref, ft)
+        return ghost(Nothing, nothing)
+    end
 end

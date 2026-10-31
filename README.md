@@ -61,7 +61,7 @@ two interfaces, `Config(host = ...)`:
   compiling to Wasm do (Go's `wasip1`, Kotlin's `wasmWasi`). The module exports its
   `memory` (a page, for the data of WASI calls) and runs its initialization from
   `_initialize`, as a WASI reactor; `js/julia.mjs` runs these too, where JavaScript has
-  no WASI (browsers). In Node, with `node:wasi`:
+  no WASI (browsers, Cloudflare Workers), without a filesystem. In Node, with `node:wasi`:
 
 ```js
 import { WASI } from 'node:wasi';
@@ -71,6 +71,31 @@ wasi.initialize(instance);
 instance.exports.f(100n);
 ```
 
+WASI file paths use absolute preopen names and a virtual working directory (`PWD`, or the
+first preopen). Preopens must occupy contiguous descriptors starting at 3; the first EBADF
+ends discovery. Resolution uses the longest component-prefix match. `link/..` is resolved
+lexically, and `cd(f, dir)` restores the old directory by path, so renaming that directory
+can prevent restoration. Permission bits, uid/gid and block counts are synthesized unless
+a mode provider is installed. Default modes do not enforce access or guarantee 0600/0700
+privacy for temporary files/directories. Access checks approximate owner bits, not ACLs or
+effective credentials. Preview 1 metadata timestamps cannot represent times before 1970.
+
+File IOStreams write synchronously to the host; `flush` has no pending file output to drain
+and does not promise durability. After read-ahead, writing or truncating requires a successful
+rewind; nonseekable duplex descriptors fail this transition and retain their read buffer.
+Writes retry EINTR from the unwritten suffix; EAGAIN is reported without waiting for host
+readiness. An error after a partial write can leave a prefix written. Raw `jl_fs_read`,
+`jl_fs_write` and `jl_fs_sendfile` return counts or negative errors, permit short IO, and cap
+each request at 1 MiB. Julia's complete-read/write wrappers loop above that interface.
+Positional IO uses `fd_pread`/`fd_pwrite` and never moves the source/current file offset.
+
+Creation followed by mode adjustment is not atomic. If a mode query or adjustment fails,
+the created object remains at the host's mode and a newly opened descriptor is closed.
+Path-based mode adjustment has replacement races. Atomic create-with-mode and
+identity-checked chmod require a stronger host interface and are outside this contract.
+Directory records up to 1 MiB and symbolic-link targets shorter than 1 MiB are supported;
+ambiguous full buffers grow to that bound and then report ENAMETOOLONG.
+
 `compile` throws `UnsupportedConstructs` with the statements it cannot compile and the
 method instances they are in, as juliac's verifier reports what it cannot trim. The module
 it returns is optimized by `wasm-opt -O3` (Binaryen_jll); `Config(optimize=nothing)` gives
@@ -79,6 +104,115 @@ the raw module, for debugging the code generator only.
 Each example builds a page: `examples/lorenz` solves the Lorenz system with adjustable
 parameters, `examples/mtk` simulates a ModelingToolkit model with sliders, and
 `examples/juliasyntax` parses Julia source in the browser.
+
+## Host runtimes
+
+The supported hosts are Node.js, wasmtime and Cloudflare workerd. The sections
+below say what each needs and what doesn't work yet.
+
+Modules use WasmGC and typed function references. A program that catches exceptions also
+uses exception handling with `exnref`; one that catches none traps on a throw instead.
+
+### Node.js
+
+Node 24 is the reference host: the tests run there. Node 24.21 enables `exnref` and JSPI
+(JavaScript Promise Integration) by default, so the tests pass no Wasm flags. JSPI is
+needed by the host's events of
+[#36](https://github.com/gbaraldi/WasmCodegen.jl/pull/36) and by Tasks on JSPI of
+[#37](https://github.com/gbaraldi/WasmCodegen.jl/pull/37) (both not merged). On a Node
+without JSPI by default, these need `--experimental-wasm-jspi`.
+
+For speed, keep the defaults: `wasm-opt -O3` and Node's own tiering. Node's
+`--liftoff-only`, `--no-liftoff` and `--no-wasm-dynamic-tiering` were each slower in
+[#43](https://github.com/gbaraldi/WasmCodegen.jl/issues/43).
+
+### Browsers
+
+Only V8 has been checked, through Node and workerd. No minimum browser version has been
+verified. The example pages' error message gives the versions that added WebAssembly GC
+(Chrome 119, Firefox 120, Safari 18.2), which is not all a module may use. Browser support
+for `exnref` and JSPI hasn't been tested here.
+
+### wasmtime
+
+Tested with wasmtime 50.0.1.
+
+- **Support.** GC, typed function references and exceptions (`exnref`) are Tier 1 and
+  enabled by default with Cranelift
+  ([status](https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/docs/stability-wasm-proposals.md)).
+  A module that imports nothing, such as a Tsit5 solve, runs with the default flags and
+  gives Node's results. A `host = :js` module that imports `julia` functions doesn't run as
+  is: `js/julia.mjs` implements them in JavaScript, and an embedder would have to provide
+  its own.
+- **WASI imports.** wasmtime rejects `host = :wasi` modules built with the current
+  WasmBuilder at instantiation, with `types incompatible`: WasmBuilder puts every type in
+  one recursion group. Modules built with
+  [gbaraldi/WasmBuilder.jl#2](https://github.com/gbaraldi/WasmBuilder.jl/pull/2) (import
+  types in recursion groups of their own, not merged) run, and give `node:wasi`'s output.
+- **GC heap size.** The default collector is the copying collector. On a Dict/String loop
+  that keeps a Dict alive, its heap stayed small and it collected constantly; a 64 MiB
+  initial heap made the loop about 5.6× faster (4.76 s to 0.85 s), for about 64 MiB more
+  memory. For allocation-heavy code, try a bigger initial heap:
+
+  ```
+  wasmtime run -O gc-heap-initial-size=67108864 --invoke f module.wasm 100
+  ```
+
+  An embedder sets
+  [`Config::gc_heap_initial_size`](https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/crates/wasmtime/src/config.rs#L1521).
+  Keep the copying collector: with `-C collector=drc` the same loop took about 4× as long
+  as with the default, and DRC doesn't collect cycles.
+- **Tasks.** Tasks on JSPI (#37) import JSPI functions from JavaScript, so they don't run
+  on wasmtime. Wasm stack switching could replace them, but wasmtime has it at Tier 3,
+  off by default, and only on x86_64 Linux.
+- **Threads.** Shared memory and atomics (Tier 2) share linear memory only, not WasmGC
+  objects, which every Julia object is here. Sharing those needs shared-everything
+  threads, which wasmtime hasn't implemented
+  ([#9466](https://github.com/bytecodealliance/wasmtime/issues/9466)). wasi-threads, a
+  thread-spawning ABI, is [legacy](https://github.com/WebAssembly/wasi-threads) and Tier 3
+  in wasmtime. Independent instances on separate threads need none of these.
+
+### Cloudflare workerd and Workers
+
+Supported on `js/julia.mjs`, for `host = :js` and `host = :wasi` modules, with
+`js/julia_task.mjs` for Tasks on JSPI and `js/julia_io.mjs` for timers. Tested locally with
+workerd 1.20261031.1 (V8 15.7) and not deployed. [`examples/workerd`](examples/workerd)
+serves a Worker that runs a Lorenz solve, the tests' Tasks program (#37: tasks, timers,
+channels) and a WASI program that reads its environment and the clock, and compares their
+output with Node's and native Julia's.
+
+- **WASI from `js/julia.mjs`.** workerd's `node:wasi` throws `ERR_METHOD_NOT_IMPLEMENTED`
+  from its constructor. `createHost({ env, args })` provides WASI preview 1 instead: the
+  arguments, the environment, the clocks, randomness and the standard streams. It exposes
+  no filesystem: no directory is preopened (workerd's own `/tmp` and `/bundle` included),
+  so file operations fail as for a path out of the preopens. `julia_io`'s HTTP is untested
+  in workerd.
+- **Modules compiled ahead of time.** Compiling at request time is disallowed ("Wasm code
+  generation disallowed by embedder"). Configure each module as a Wasm module of the
+  Worker (`(name = "m.wasm", wasm = embed "m.wasm")` in workerd's configuration;
+  `import m from './m.wasm'` with Wrangler) and pass the `WebAssembly.Module` it imports to
+  `instantiate` or `WebAssembly.instantiate`.
+- **Compatibility flags.** `nodejs_compat`, for `julia_io.mjs` and `julia_task.mjs`, is on by
+  default from the compatibility date 2026-08-04. JSPI needs no flag. JS string builtins
+  (`wasm:js-string`) and string constants need `wasm_esm_integration_builtins`
+  (`compatibilityFlags = ["wasm_esm_integration_builtins"]`, or `compatibility_flags` in
+  `wrangler.toml`); WasmCodegen's modules use neither.
+- **Production limits** ([limits](https://developers.cloudflare.com/workers/platform/limits/)),
+  which local workerd doesn't enforce: 128 MB of memory per isolate, including Wasm; CPU
+  time per HTTP request, 10 ms on the Free plan and 30 s by default (up to 5 minutes) on
+  the Paid plan; 64 MiB of uncompressed bundle; 1 s of startup. A Worker's clocks advance
+  only between I/O operations.
+
+### Not supported or untested
+
+- **WasmEdge** 0.18.1 is not a supported host, and WasmCodegen's output hasn't been tried
+  there. Its [0.18.0 release](https://github.com/WasmEdge/WasmEdge/releases/tag/0.18.0)
+  turned on the Wasm 3.0 proposals, including exception handling, function references and
+  tail calls, by default. Its [proposal tracker](https://github.com/WasmEdge/WasmEdge/issues/4825)
+  still lists GC as unfinished (a real runtime collector,
+  [#4156](https://github.com/WasmEdge/WasmEdge/pull/4156)), as well as stack switching and the
+  component model.
+- Other engines and runtimes haven't been tried: Wasmer, wazero, Deno and Bun.
 
 ## How it works
 
