@@ -24,6 +24,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("eachindex_trim.jl")
     include("task_fields.jl")
     include("ptrcarry.jl")
+    include("locals.jl")
     include("regressions.jl")
     include("exprs.jl")
     include("ir_cache.jl")

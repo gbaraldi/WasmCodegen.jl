@@ -64,6 +64,10 @@ Base.@kwdef struct Config
     the functions, finishing the module, writing, validating and optimizing it), with what it
     did and its elapsed time."
     progress::Bool = false
+    "Values whose lifetimes do not overlap share a local of their type (`locals.jl`): only the
+    numbering of locals changes. Keeps the largest functions under engines' limits on locals
+    (V8: 50,000) without `wasm-opt`, and gives `wasm-opt` fewer locals to work on."
+    reuse_locals::Bool = true
     image_pointer_fields::Vector{Tuple{Any,Symbol}} = Tuple{Any,Symbol}[]
     extra_patches::Vector{String} = String[]
     patch_bindings::Vector{Pair{Symbol,Any}} = Pair{Symbol,Any}[]

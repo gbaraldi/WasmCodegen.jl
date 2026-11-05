@@ -183,6 +183,11 @@ function emit_module(w::ClosedWorld, mis::Vector{Core.MethodInstance}, entries::
     t = time_ns()
     finish_module!(cgm)
     progress(config, "finish", t, "the image and the tables over types")
+    if config.reuse_locals
+        t = time_ns()
+        foreach(reuse_locals!, cgm.mod.funcs)
+        progress(config, "locals", t, "shared by values whose lifetimes do not overlap")
+    end
     t = time_ns()
     bytes = to_bytes(cgm.mod)
     progress(config, "write", t, length(bytes), " bytes")

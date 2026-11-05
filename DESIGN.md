@@ -35,6 +35,8 @@ emit: walk the structured IR → WasmBuilder (validating builder)
   ▼
 image: serialize the referenced objects; start function completes them (WASI: _initialize)
   ▼
+locals: values whose lifetimes do not overlap share a local of their type (renumbering only)
+  ▼
 raw module (WasmBuilder's validation, and wasm-tools' when installed)
   ▼
 wasm-opt -O3 (Binaryen_jll): locals, stack code, inlining, the rest
@@ -508,6 +510,16 @@ recursive parser. What the code generator does avoid is code `wasm-opt` would ha
 remove at a cost: without the rules of section 3, `wasm-opt` takes 13 times longer on the
 parser (683 s against 53 s) for a worse module, and destination passing halved it again
 (23 s). Most of its time is `simplify-locals` on the largest functions.
+
+The one allocation the code generator does itself is sharing locals (`locals.jl`,
+`Config(reuse_locals)`, on by default), so that a raw module stays within an engine's limits:
+LAPACK's multishift QR sweep (`_dlaqr5!`, as PureBLAS has it) emits 56,000 locals, past V8's
+limit of 50,000, and its module did not load without `wasm-opt`. After emission,
+each function's locals are renumbered: a local with one assignment, whose reads all follow it
+in the construct body the assignment is in, holds one value, live from the assignment to its
+last read (to the end of each loop the read is in that the assignment is not); such locals of
+the same type with disjoint ranges share a slot, and every other local (results of `if`s, loop
+carries) keeps its own. Instructions are unchanged. `_dlaqr5!` keeps 14,000 locals.
 
 For the parser, a compile takes about 23 s in `wasm-opt`, 8 s in IRStructurizer, 3 s in
 juliac's verifier and 2 s in the code generator (after Julia's inference, cached across
