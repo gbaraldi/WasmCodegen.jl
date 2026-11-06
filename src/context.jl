@@ -61,8 +61,8 @@ Base.@kwdef struct Config
     as it is. See `ir_cache_stats`, `empty_ir_cache!`."
     ir_cache::Bool = false
     "A line on stderr at the end of each phase of the compilation (collecting the world, emitting
-    the functions, finishing the module, writing, validating and optimizing it), with what it
-    did and its elapsed time."
+    the functions, finishing the module, reusing locals, writing, validating and optimizing it),
+    with what it did and its elapsed time."
     progress::Bool = false
     "Values whose lifetimes do not overlap share a local of their type (`locals.jl`): only the
     numbering of locals changes. Keeps the largest functions under engines' limits on locals

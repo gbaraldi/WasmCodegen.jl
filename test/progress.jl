@@ -15,7 +15,7 @@ end
     out = stderr_of(() -> (c = WasmCodegen.compile(progress_prog, (Float64,); config = test_config(progress = true))))
     lines = filter(startswith("WasmCodegen: "), split(out, '\n'))
     phases = [split(l, ':')[2] for l in lines]
-    @test phases == [" collect", " emit", " finish", " write", " validate", " optimize"]
+    @test phases == [" collect", " emit", " finish", " locals", " write", " validate", " optimize"]
     @test all(l -> occursin(r": .*\b\d+\.\d s", l), lines)
     @test occursin(r"emit: \d+ functions \(exceptions: \w+\), 0 unsupported constructs, \d+\.\d s \(structurizing \d+\.\d s\)", out)
     @test occursin(r"write: \d+ bytes", out)
