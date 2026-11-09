@@ -303,6 +303,11 @@ built it.
 - Large numeric arrays are `array.new_default` in the initializer and filled by the start
   function from passive data segments (`array.init_data`); large reference arrays are filled
   by the start function.
+- The elements of a memory of numbers that Julia leaves undefined are zeros, not the bytes the
+  build's memory held there: where every reference to the memory is from an owner that says
+  which elements it defines (an `Array`: its extent; a `Dict`: its filled slots), those none
+  defines (`zero_undefined_elements!`). Native images write a memory's bytes whole
+  (`jl_write_values`); a module is published, and should not depend on the build machine.
 - `MemoryRef` constants are (Memory object, array, index); type objects are interned, and
   carry their native `objectid` (as mutable objects do), so that `IdDict`s with type keys
   built at compile time find them.

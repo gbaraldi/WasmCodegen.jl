@@ -53,13 +53,16 @@ mutable struct Image
     functions it needed first."
     suppressed::IdDict{Any,Vector{Any}}
     optional_children::IdDict{Any,Vector{Any}}
+    "Memories of numbers: their references, the elements their owners define, and where the
+    serialized elements are (see `zero_undefined_elements!`)."
+    numeric::IdDict{Any,Any}
 end
 
 Image(cgm) = Image(cgm, IdDict{Any,Global}(), IdDict{Any,Global}(), IdDict{Any,Global}(),
                    IdSet{Any}(), Inst[], Inst[], Any[],
                    Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}(), IdDict{Any,Global}(), 0,
                    UInt64[], nothing, false, false, IdSet{Any}(), IdDict{Any,Any}(), IdDict{Any,Vector{Any}}(),
-                   IdSet{Any}(), IdDict{Any,Vector{Any}}(), IdDict{Any,Vector{Any}}())
+                   IdSet{Any}(), IdDict{Any,Vector{Any}}(), IdDict{Any,Vector{Any}}(), IdDict{Any,Any}())
 
 """
     header_hash(img, x) -> Inst
@@ -330,6 +333,7 @@ The global of the object `x` (of a boxed type), serializing it (and the objects 
 to) on first use.
 """
 function object_global!(img::Image, @nospecialize(x))
+    x isa GenericMemory && (memory_use!(img, x).reaches += 1)
     g = get(img.globals, x, nothing)
     if g !== nothing
         note_reach!(img, x)
@@ -504,6 +508,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout; register::Bool=
     ts = types(img)
     T = typeof(x)
     img.cgm.config.shell_first_mutables && ismutabletype(T) && return mutable_global!(img, x, l)
+    note_memory_owner!(img, x)
     push!(img.inprogress, x)
     back = Any[]
     init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]
@@ -672,9 +677,84 @@ function numeric_memory_global!(img::Image, mem, ml::MemoryLayout)
                 push!(elems, primitive_const(x, Leaf[])[1])
             end
         end
-        return add_array_global!(img, nothing, ml.array, n, elems, false)
+        g = add_array_global!(img, nothing, ml.array, n, elems, false)
+        memory_use!(img, mem).fixed = g
+        return g
     end
+    memory_use!(img, mem).bytes = bytes
     return data_array_global!(img, nothing, ml.array, n, bytes)
+end
+
+## elements of memories of numbers that no owner defines
+
+# A memory of numbers natively has whatever bytes its allocation held where nothing was
+# written: the capacity of a `Vector` beyond its length, the slots of a `Dict` without an
+# entry. Julia leaves those elements undefined, but they are serialized with the rest, so a
+# module would carry bytes of the build process's memory (a different module each build).
+# Where every reference to such a memory is from an owner that says which elements it defines
+# (an `Array`: those of its extent; a `Dict`: those of its filled slots), the elements none
+# of them defines are zeros. A memory referred to otherwise is kept as it is. (Native images
+# write a memory's bytes whole too, `jl_write_values` in staticdata.c, but they are not a
+# published artifact built anew on every machine.)
+
+mutable struct MemoryUse
+    "The references to the memory the image serialized (`object_global!`)."
+    reaches::Int
+    "Per owner: the elements it defines."
+    defined::Vector{BitVector}
+    "Where its serialized elements are: its data segment, or the global built by `array.new_fixed`."
+    bytes::Union{Nothing,Vector{UInt8}}
+    fixed::Union{Nothing,Global}
+end
+
+memory_use!(img::Image, mem) = get!(() -> MemoryUse(0, BitVector[], nothing, nothing), img.numeric, mem)
+
+# the elements `x` defines of the memories it refers to: an Array's extent, a Dict's filled slots
+function note_memory_owner!(img::Image, @nospecialize(x))
+    if x isa Array
+        ref = getfield(x, :ref)
+        mem = ref.mem
+        d = falses(length(mem))
+        n = length(x)
+        n > 0 && (d[Base.memoryrefoffset(ref):Base.memoryrefoffset(ref)+n-1] .= true)
+        push!(memory_use!(img, mem).defined, d)
+    elseif x isa Dict
+        for mem in (getfield(x, :keys), getfield(x, :vals))
+            push!(memory_use!(img, mem).defined, BitVector(Base.isslotfilled(x, i) for i in 1:length(mem)))
+        end
+    end
+    return
+end
+
+"""
+    zero_undefined_elements!(cgm)
+
+The elements of memories of numbers that none of their owners defines, zeros (see
+`note_memory_owner!`), once every reference is serialized: in their data segments, or in the
+initializers of the globals that build them.
+"""
+function zero_undefined_elements!(cgm::CGModule)
+    for (mem, u) in cgm.image.numeric
+        u = u::MemoryUse
+        n = length(mem)
+        (n == 0 || isempty(u.defined) || u.reaches != length(u.defined)) && continue
+        (u.bytes === nothing && u.fixed === nothing) && continue
+        undefined = .!reduce(.|, u.defined)
+        any(undefined) || continue
+        if u.bytes !== nothing
+            per = length(u.bytes) ÷ n
+            for i in findall(undefined)
+                fill!(view(u.bytes, (i - 1) * per + 1:i * per), 0x00)
+            end
+        else
+            init = u.fixed.init
+            per = (length(init) - 1) ÷ n
+            for i in findall(undefined), k in (i - 1) * per + 1:i * per
+                init[k] = Inst(init[k].op, zero(init[k].imm[1]))
+            end
+        end
+    end
+    return
 end
 
 # an array global filled by the start function from a data segment
@@ -865,6 +945,7 @@ end
 # holds a shell (header and default fields), so that any object reached from its fields may refer
 # back to it, and the start function sets its fields.
 function mutable_global!(img::Image, @nospecialize(x), l::Layout)
+    note_memory_owner!(img, x)
     ts = types(img)
     T = typeof(x)
     init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]

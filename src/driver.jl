@@ -256,6 +256,7 @@ function finish_module!(cgm::CGModule)
     finish_types!(cgm)
     finish_subtype!(cgm)
     finish_host!(cgm)
+    zero_undefined_elements!(cgm)
 end
 
 """
