@@ -93,6 +93,10 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
     args = CGVal[a for a in args]
     f === II.cglobal && return emit_cglobal!(fc, args[1], typ)
     f === II.llvmcall && return emit_llvmcall!(fc, args, typ)
+    for a in args
+        is_boxed_ptr_type(a.typ) &&
+            unsupported("the intrinsic ", f, " on a pointer whose type is not concrete, ", a.typ)
+    end
     if !(f in PTR_INTRINSICS) && (any(a -> is_ptr_type(a.typ), args) || is_ptr_type(typ))
         # integer operations on pointers: of their addresses
         r = emit_intrinsic!(fc, f, Any[is_ptr_type(a.typ) ? ptr_address(a) : a for a in args],
