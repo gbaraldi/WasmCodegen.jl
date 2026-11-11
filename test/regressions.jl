@@ -360,6 +360,12 @@ function rg_singleton_nested(n::Int)
     return (t === s, s === t, t[3] === (nothing,), (nothing,) === t[1])
 end
 
+# Pointer intrinsics on a pointer whose type is not concrete (`Ptr`, a value held as an object):
+# reported as unsupported, where the module failed validation.
+rg_ptr_add(p::Ptr, n::Int) = p + n
+rg_ptr_sub(p::Ptr, n::Int) = p - n
+rg_ptr_uint(p::Ptr) = UInt(p)
+
 @testset "regressions" begin
     @wtest rg_unionfield(true, true)
     @wtest rg_unionfield(false, false)
@@ -475,4 +481,11 @@ end
         @wtest rg_singleton_vararg(n)
     end
     @wtest rg_singleton_nested(1); @wtest rg_singleton_nested(2)
+    for (f, argtypes) in ((rg_ptr_add, (Ptr, Int)), (rg_ptr_sub, (Ptr, Int)), (rg_ptr_uint, (Ptr,)),
+                          (rg_ptr_add, (Ptr{T} where T<:Integer, Int)), (+, (Int, Ptr)))
+        err = try wcompile(f, argtypes); nothing catch e; e end
+        @test err isa WasmCodegen.UnsupportedConstructs &&
+              occursin("on a pointer whose type is not concrete", sprint(showerror, err))
+    end
+    @test wcompile(rg_ptr_add, (Ptr{UInt8}, Int)) isa WasmCodegen.Compilation
 end
