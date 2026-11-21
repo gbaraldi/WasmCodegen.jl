@@ -14,7 +14,8 @@ its result is a value of type `T`, and its body is `body(hfc, hargs)`, the emiss
 operation in the helper's context `hfc` on its parameters `hargs`. Constants the
 operation depends on belong in `key`, not in `args`.
 """
-function call_outlined!(fc::FnCtx, key, name, args::Vector{CGVal}, @nospecialize(T), body)
+function call_outlined!(fc::FnCtx, @nospecialize(key), @nospecialize(name), args::Vector{CGVal}, @nospecialize(T),
+                        @nospecialize(body))
     cgm = fc.cgm
     lt = layout(fc, T)
     failed = get(cgm.helpers, (:outline_unsupported, key), nothing)
